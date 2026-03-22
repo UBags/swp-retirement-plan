@@ -1,0 +1,18 @@
+# Ignore everything
+*
+
+# Un-ignore .py files in the root only
+!*.py
+
+# Un-ignore .gitignore itself
+!.gitignore
+
+# Explicitly ignore everything in subdirectories
+# (the * above catches subdirectory contents, but be explicit about dirs)
+__pycache__/
+.venv/
+.idea/
+older_versions/
+Schemes_and_Funds/
+test/
+Uddipan/
