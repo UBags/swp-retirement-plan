@@ -1,3 +1,6 @@
+# Copyright (c) 2025 Uddipan Bagchi. All rights reserved.
+# See LICENSE in the project root for license information.package com.costheta.cortexa.action
+
 """
 Debug script: Add to your project directory and run from there.
   python debug_other.py

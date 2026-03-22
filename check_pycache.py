@@ -1,3 +1,6 @@
+# Copyright (c) 2025 Uddipan Bagchi. All rights reserved.
+# See LICENSE in the project root for license information.package com.costheta.cortexa.action
+
 """
 Quick diagnostic: run from your app directory.
   cd C:\PythonProjects\RetirementTaxPlanning
