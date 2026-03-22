@@ -112,7 +112,7 @@ flowchart LR
     P5[glide_path.py\nbuild schedule]:::process
     F6[(GlidePath\nyear → weights)]:::file
     P6[engine.py\n360-month simulation]:::process
-    O1[(MonthlyRow[]\nYearSummary[])]:::output
+    O1[(MonthlyRow × 360\nYearSummary × 30)]:::output
     P7[monte_carlo.py\nblock bootstrap]:::process
     O2[(MCResults\nfan charts + ruin %)]:::output
 
