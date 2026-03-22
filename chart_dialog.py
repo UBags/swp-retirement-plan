@@ -1,5 +1,5 @@
 # Copyright (c) 2025 Uddipan Bagchi. All rights reserved.
-# See LICENSE in the project root for license information.package com.costheta.cortexa.action
+# See LICENSE in the project root for license information.
 
 """
 chart_dialog.py – Non-modal chart pop-ups for SWP Planner tables.
