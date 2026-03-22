@@ -1,5 +1,5 @@
 # Copyright (c) 2025 Uddipan Bagchi. All rights reserved.
-# See LICENSE in the project root for license information.package com.costheta.cortexa.action
+# See LICENSE in the project root for license information.
 
 """
 Debug script: Add to your project directory and run from there.
