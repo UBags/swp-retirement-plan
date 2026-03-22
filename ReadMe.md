@@ -1,6 +1,7 @@
 # 📊 SWP Financial Planner
 
 > A desktop application for Indian retirees planning a **Systematic Withdrawal Plan (SWP)** from a portfolio of mutual funds — optimising fund selection, computing taxes across Individual and HUF entities, and stress-testing corpus survival with Monte Carlo simulation over a 30-year horizon.
+> Nearly 21000 lines of python code
 
 > **Copyright (c) 2025 Uddipan Bagchi. All rights reserved.**
 > **See LICENSE in the project root for license information.**
