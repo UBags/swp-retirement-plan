@@ -4,11 +4,11 @@
 # Un-ignore .py files in the root only
 !*.py
 
-# Un-ignore .gitignore itself
+# Un-ignore README and .gitignore itself
+!README.md
 !.gitignore
 
-# Explicitly ignore everything in subdirectories
-# (the * above catches subdirectory contents, but be explicit about dirs)
+# Explicitly ignore subdirectories
 __pycache__/
 .venv/
 .idea/
