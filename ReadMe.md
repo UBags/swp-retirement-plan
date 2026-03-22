@@ -1,789 +1,651 @@
-# SWP Financial Planner
+# 📊 SWP Financial Planner
 
-A desktop application for Indian retirees planning a **Systematic Withdrawal Plan (SWP)** from a portfolio of mutual funds. It models 30 years of withdrawals, optimises fund selection and allocation across multiple time chunks, computes taxes (Individual + HUF split), benchmarks against FD returns, and runs Monte Carlo stress tests.
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Architecture](#architecture)
-- [Data Pipeline](#data-pipeline)
-- [Module Reference](#module-reference)
-- [Key Algorithms](#key-algorithms)
-- [Configuration](#configuration)
-- [Installation](#installation)
-- [Usage](#usage)
-- [File Outputs](#file-outputs)
+> A desktop application for Indian retirees planning a **Systematic Withdrawal Plan (SWP)** from a portfolio of mutual funds — optimising fund selection, computing taxes across Individual and HUF entities, and stress-testing corpus survival with Monte Carlo simulation over a 30-year horizon.
 
 ---
 
-## Overview
+## ✨ What it does
 
-The core thesis is that a well-structured portfolio of **debt + arbitrage mutual funds** split across an **Individual + HUF** entity pair can significantly outperform fixed deposits on an after-tax basis over a 30-year retirement horizon.
+The core thesis: a well-structured portfolio of **debt + arbitrage mutual funds** split across an **Individual + HUF** entity pair can significantly outperform fixed deposits on an after-tax basis over 30 years.
 
-The planner:
-
-1. Downloads live AMFI NAV data and computes fund quality metrics (Sharpe, Sortino, Calmar, Alpha, Max DD, Combined Ratio) across 3Y / 5Y / 10Y windows.
-2. Uses a **Mixed-Integer Linear Program** (HiGHS via SciPy, or PuLP/CBC) to allocate capital across the best funds, subject to constraints on return, volatility, drawdown, and per-fund / per-type / per-AMC concentration.
-3. Simulates month-by-month withdrawals for 30 years using a full tax engine (progressive slabs, LTCG, STCG, 87A rebate, cess, exit loads).
-4. Optionally optimises fund selection across multiple time chunks with a **Two-Pass Aim-and-Track** backward-induction algorithm that minimises portfolio turnover between chunks.
-5. Runs a **Historical Block Bootstrap** Monte Carlo using real Nifty 50 and Nifty Composite Debt index data to stress-test corpus survival probability.
-
----
-
-## Architecture
-
-### High-Level Component Map
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        DATA ACQUISITION LAYER                       │
-│                                                                     │
-│  get_amfi_fund_schemes_names.py      fetch_amfi_aum.py              │
-│        │ NAVAll.txt                        │ Fund-Performance API   │
-│        ▼                                  ▼                         │
-│  mutual_funds.csv                  amfi_aum.csv                     │
-│        │                                  │                         │
-│        └──────────────────┬───────────────┘                         │
-│                           ▼                                         │
-│                 get_funds_data.py                                   │
-│            (NAV history → risk metrics)                             │
-│                           │                                         │
-│                           ▼                                         │
-│                Fund_Metrics_Output.csv                              │
-│                   (807 funds, 33 columns)                           │
-└─────────────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                      OPTIMISATION LAYER                             │
-│                                                                     │
-│                    allocate_funds.py                                │
-│                                                                     │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  MILP Solvers                                                │  │
-│  │  _solve()            HiGHS via scipy.milp  (Coarse/Fine/α)  │  │
-│  │  _solve_frontier()   Frontier Walk          (HiGHS)          │  │
-│  │  run_pulp_*()        PuLP / CBC             (Commonality)    │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  Multi-Chunk Orchestration                                   │  │
-│  │  run_aim_pass_multi()     λ-blending candidate generation    │  │
-│  │  run_frontier_walk()      risk-floor candidate generation    │  │
-│  │  run_pulp_commonality_walk()  PuLP commonality walk          │  │
-│  │  score_combinations()     cross-chunk combination scoring    │  │
-│  │  run_aim_pass()           Two-Pass Aim   (Pass 1)            │  │
-│  │  run_track_pass()         Two-Pass Track (Pass 2, backward)  │  │
-│  │  optimize_sticky_portfolio()  top-level Mode A / B driver    │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│                                                                     │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  Post-Allocation                                             │  │
-│  │  fine_tune()              quality-aware weight rebalance     │  │
-│  │  _substitution_advisor()  risk-reducing fund swap advisor    │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                       GLIDE PATH LAYER                              │
-│                                                                     │
-│                       glide_path.py                                 │
-│                                                                     │
-│  build_glide_path()      year-by-year weight schedule (years 1–30) │
-│  build_flat_glide_path() Mode A (buy-and-hold, constant weights)   │
-│                                                                     │
-│  Linear interpolation over a transition window centred on each     │
-│  chunk boundary spreads rebalancing over N years to minimise CGT.  │
-└─────────────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                      SIMULATION LAYER                               │
-│                                                                     │
-│                        engine.py                                    │
-│                                                                     │
-│  Month-by-month for up to 360 months:                               │
-│  • Per-fund FIFO lot tracking + per-fund NAV growth                 │
-│  • Bounded Smart Withdrawal waterfall (weight-drift correction)     │
-│  • Annual micro-rebalancing (HIFO lot selection, no-trade band)     │
-│  • Full tax computation at FY boundaries                            │
-│    (progressive slab + LTCG + STCG + 87A + cess + exit loads)      │
-│  • HUF parallel portfolio                                           │
-│  • FD benchmark in parallel                                         │
-│                                                                     │
-│  Outputs: List[MonthlyRow], List[YearSummary]  (personal + HUF)    │
-└─────────────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     MONTE CARLO LAYER                               │
-│                                                                     │
-│                     monte_carlo.py                                  │
-│                                                                     │
-│  Mode 1: Historical Block Bootstrap                                 │
-│    • Nifty 50 NAV history (mfapi.in → AMFI portal fallback)        │
-│    • Nifty Composite Debt Index (embedded)                          │
-│    • Contiguous blocks preserve volatility clustering               │
-│  Mode 2: Log-normal fallback                                        │
-│                                                                     │
-│  σ per FY = Σ(w_i × σ_i)  [linear, perfect-correlation upper bound]│
-│  Floor = mu − N × sigma  (default N = 3)                           │
-│                                                                     │
-│  Outputs: MCResults (P5/P25/P50/P75/P95 corpus & cash, ruin prob)  │
-└─────────────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                       UI LAYER  (PySide6)                           │
-│                                                                     │
-│  run.py                  launch, per-user output directory          │
-│  main.py                 MainWindow, 4-scenario tabs, menus         │
-│  dialogs.py              income, requirements, windfalls, HUF, FD   │
-│  fund_dialog.py          fund selection & allocation viewer/editor  │
-│  tax_dialog.py           tax rules editor (slabs, LTCG rates)       │
-│  chart_dialog.py         Matplotlib chart pop-ups (non-modal)       │
-│  optimization_report.py  post-optimisation 4-tab summary            │
-│  chunk_editor.py         reusable year-range chunk table widget     │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Data Model
-
-```
-AppState
-├── funds: List[FundEntry]                  ← flat fund list (Mode A fallback)
-├── allocation_chunks: List[AllocationChunk]
-│   ├── year_from, year_to
-│   ├── funds: List[FundEntry]
-│   │   └── name, fund_type (debt/equity/other), allocation (₹L)
-│   │       std_dev, sharpe, sortino, calmar, alpha, treynor
-│   │       max_dd, beta, combined_ratio
-│   │       cagr_1/3/5/10, worst_exp_ret, amfi_fund_type
-│   ├── target_weights: Dict[fund_name, weight]   ← set by optimizer
-│   └── constraint_slack_used: Dict               ← set by track pass
-│
-├── individual_debt_chunks:   List[TaxChunk]       (progressive slabs + 87A)
-├── individual_equity_chunks: List[EquityTaxChunk] (12.5% LTCG + exemption)
-├── individual_other_chunks:  List[OtherTaxChunk]  (12.5% flat, Gold/Intl)
-├── huf_debt/equity/other_chunks                   (same structure, no 87A)
-│
-├── annual_requirements: Dict[year, amount_L]
-├── huf_withdrawal_chunks / huf_annual_requirements
-├── return_chunks / fd_rate_chunks / split_chunks
-├── windfalls / personal_income / huf_income
-│
-├── allocation_mode: "singular" | "chunked_sticky"
-├── rebalance_spread_years: int             (glide path transition width)
-└── glide_path: Optional[GlidePath]
-        └── schedule: Dict[year(1–30), Dict[fund_name, weight]]
-```
-
----
-
-## Data Pipeline
-
-```
-AMFI NAVAll.txt ─────────────────────────────────────────────┐
-AMFI Fund-Performance API                                    │
-         │                                                   │
-         ▼                                                   │
- get_amfi_fund_schemes_names.py                              │
-   Downloads NAVAll.txt → (Fund Type, Fund Name) CSV         │
-   Optional AUM filter via fetch_amfi_aum.py                 │
-   Output: mutual_funds.csv / mutual_funds_minNcr.csv        │
-         │                                                   │
-         ▼                                                   │
-   [User adds Allocation_L column marking funds of interest] │
-         │                                                   │
-         ▼                                                   │
- get_funds_data.py                                           │
-   AMFI code resolution (exact → fuzzy → overrides)          │
-   NAV download: mfapi.in primary, AMFI portal fallback      │
-   NAV split/consolidation auto-correction                   │
-   Risk-free rate: overnight fund NAV (RBI repo fallback)    │
-   Benchmark: Nifty Composite Debt Index                     │
-   Metrics per 3Y / 5Y / 10Y window:                         │
-     Std_Dev, Sharpe, Sortino, Max_DD, Calmar                │
-     Combined_Ratio = sqrt(Sortino × Calmar)                 │
-   Alpha / Beta / Treynor (10Y regression vs benchmark)      │
-   Worst_Exp_Ret_% = min(CAGR windows) − 0.40% STT (arb)    │
-   Output: Fund_Metrics_Output.csv                           │
-         │                                                   │
-         │  reclassify_legacy_funds.py                       │
-         │    Re-classifies pre-SEBI "Income"/"Growth" funds │
-         │    by scraping Groww.in for current category      │
-         │                                                   │
-         ▼                                                   │
- Fund_Metrics_Output.csv ◄───────────────────────────────────┘
-   (807 funds, 33 metric columns)
-         │
-         ▼
- allocate_funds.py → AllocationChunk.target_weights
-```
-
----
-
-## Module Reference
-
-### `configuration.py`
-Singleton that reads `RetirementTaxPlanning.configuration` once at startup. All modules access it via `from configuration import config`. Values auto-cast to int / float / bool.
-
----
-
-### `models.py`
-Pure data layer — dataclasses only, no UI or computation.
-
-| Class | Purpose |
+| Capability | Detail |
 |---|---|
-| `FundEntry` | Single fund: allocation, all risk metrics, CAGRs, amfi_fund_type |
-| `AllocationChunk` | Time-period bucket: funds + target_weights + constraint_slack_used |
-| `GlidePath` | Year-by-year weight schedule (1–30) for glide-path rebalancing |
-| `AppState` | Master state — serialised to/from JSON for project save/load |
-| `TaxChunk` / `TaxSlab` | Progressive slab tax per time period (debt) |
-| `EquityTaxChunk` | Flat LTCG rate + annual exemption per time period |
-| `OtherTaxChunk` | 12.5% LTCG flat (Gold ETFs / International ETFs) |
-| `ReturnChunk` | Expected annual return per time period |
-| `FDRateChunk` | FD benchmark interest rate per time period |
-| `HUFWithdrawalChunk` | Annual HUF withdrawal target per time period |
-| `WindfallEntry` | One-off corpus addition in a given plan year |
-| `RebalanceCost` | Tax + exit loads incurred in a single rebalancing year |
+| 📥 **Data Acquisition** | Downloads live AMFI NAV data, computes Sharpe / Sortino / Calmar / Alpha / Max DD across 3Y / 5Y / 10Y windows |
+| 🧮 **Portfolio Optimisation** | Mixed-Integer Linear Program (HiGHS + PuLP/CBC) with constraints on return, volatility, drawdown, per-fund, per-type, and per-AMC concentration |
+| 📅 **Multi-Chunk Planning** | Separate optimal portfolios for different life phases (e.g. years 1–10, 11–20, 21–30) with minimised turnover between phases |
+| 🔀 **Glide Path** | Linear weight interpolation across chunk boundaries — monthly withdrawals do the rebalancing, avoiding large CGT events |
+| 💰 **Full Tax Engine** | Month-by-month simulation: progressive slabs, LTCG, STCG, 87A marginal relief, cess, exit loads — Individual and HUF in parallel |
+| 🎲 **Monte Carlo** | Historical Block Bootstrap using real Nifty 50 + Nifty Composite Debt index data; log-normal fallback |
+| 📋 **4-Scenario Comparison** | Run up to 4 independent allocation strategies side-by-side |
 
 ---
 
-### `get_amfi_fund_schemes_names.py`
-Downloads the AMFI `NAVAll.txt` master feed and produces a clean CSV of `(Fund Type, Fund Name)` pairs. Optionally cross-references `fetch_amfi_aum.py` to filter by minimum AUM (e.g. ≥ ₹1,000 Cr).
+## 🗺️ System Architecture
 
-```
-python get_amfi_fund_schemes_names.py \
-    --output-dir ./Schemes_and_Funds \
-    [--min-aum 1000] \
-    [--date DD-Mon-YYYY]
+```mermaid
+graph TB
+    subgraph DATA["📥 Data Acquisition Layer"]
+        A1[get_amfi_fund_schemes_names.py<br/>AMFI NAVAll.txt feed] --> A3
+        A2[fetch_amfi_aum.py<br/>AMFI Performance API] --> A3
+        A3[mutual_funds.csv<br/>+ AUM filter] --> A4
+        A4[get_funds_data.py<br/>NAV history → metrics] --> A5
+        A4b[reclassify_legacy_funds.py<br/>Groww scraper] -.->|re-classifies pre-SEBI funds| A4
+        A5[(Fund_Metrics_Output.csv<br/>807 funds · 33 columns)]
+    end
+
+    subgraph OPT["🧮 Optimisation Layer"]
+        B1[allocate_funds.py]
+        B2[MILP: _solve<br/>HiGHS · scipy.milp]
+        B3[MILP: _solve_frontier<br/>Frontier Walk · HiGHS]
+        B4[MILP: run_pulp_*<br/>Commonality Walk · CBC]
+        B1 --> B2 & B3 & B4
+    end
+
+    subgraph GP["🔀 Glide Path Layer"]
+        C1[glide_path.py<br/>build_glide_path]
+        C2[GlidePath<br/>year 1–30 weight schedule]
+        C1 --> C2
+    end
+
+    subgraph SIM["⚙️ Simulation Layer"]
+        D1[engine.py · Engine.run]
+        D2[Per-fund FIFO lot tracker]
+        D3[Bounded Smart Withdrawal]
+        D4[HIFO micro-rebalancing]
+        D5[FY tax computation]
+        D1 --> D2 & D3 & D4 & D5
+    end
+
+    subgraph MC["🎲 Monte Carlo Layer"]
+        E1[monte_carlo.py]
+        E2[Historical Block Bootstrap<br/>Nifty 50 + Debt Index]
+        E3[Log-normal fallback]
+        E1 --> E2 & E3
+    end
+
+    subgraph UI["🖥️ UI Layer · PySide6"]
+        F1[main.py · MainWindow]
+        F2[fund_dialog.py]
+        F3[tax_dialog.py]
+        F4[chart_dialog.py]
+        F5[optimization_report.py]
+        F6[dialogs.py]
+        F7[chunk_editor.py]
+    end
+
+    A5 --> B1
+    B1 --> C1
+    C2 --> D1
+    D1 --> E1
+    D1 & E1 --> F1
+    F1 --> F2 & F3 & F4 & F5 & F6
+
+    style DATA fill:#1a1a2e,stroke:#4a90d9,color:#e0e0e0
+    style OPT  fill:#16213e,stroke:#e94560,color:#e0e0e0
+    style GP   fill:#0f3460,stroke:#53d8fb,color:#e0e0e0
+    style SIM  fill:#1a1a2e,stroke:#4ade80,color:#e0e0e0
+    style MC   fill:#16213e,stroke:#f59e0b,color:#e0e0e0
+    style UI   fill:#0f3460,stroke:#a78bfa,color:#e0e0e0
 ```
 
 ---
 
-### `fetch_amfi_aum.py`
-POSTs to the AMFI fund-performance API across all 39 open-ended SEBI subcategories to collect daily AUM per fund. Rate-limited at 0.4 s between calls. Produces `amfi_aum.csv`.
+## 🔄 End-to-End Data Flow
 
-```
-python fetch_amfi_aum.py \
-    --output-dir ./Schemes_and_Funds \
-    [--date DD-Mon-YYYY] \
-    [--min-aum 0]
-```
+```mermaid
+flowchart LR
+    classDef file    fill:#1e3a5f,stroke:#4a90d9,color:#e0e0e0,rx:6
+    classDef process fill:#2d1b4e,stroke:#a78bfa,color:#e0e0e0,rx:6
+    classDef output  fill:#1a3a2a,stroke:#4ade80,color:#e0e0e0,rx:6
+    classDef user    fill:#3a1a1a,stroke:#f87171,color:#e0e0e0,rx:6
 
----
+    U1([👤 User\nmarks funds of interest]):::user
+    P1[get_amfi_fund_schemes_names]:::process
+    P2[fetch_amfi_aum]:::process
+    F1[(mutual_funds.csv)]:::file
+    F2[(amfi_aum.csv)]:::file
+    F3[(Fund_Details.csv\nwith Allocation_L)]:::file
+    P3[get_funds_data.py\nNAV download + metrics]:::process
+    F4[(Fund_Metrics_Output.csv)]:::file
+    P4[allocate_funds.py\nMILP optimisation]:::process
+    F5[(allocation_chunk_N.csv\nper-chunk weights)]:::file
+    P5[glide_path.py\nbuild schedule]:::process
+    F6[(GlidePath\nyear → weights)]:::file
+    P6[engine.py\n360-month simulation]:::process
+    O1[(MonthlyRow[]\nYearSummary[])]:::output
+    P7[monte_carlo.py\nblock bootstrap]:::process
+    O2[(MCResults\nfan charts + ruin %)]:::output
 
-### `get_funds_data.py`
-The fund metrics engine. For each fund in the input CSV:
-
-1. **AMFI code resolution** — exact name match → fuzzy match → `KNOWN_CODE_OVERRIDES` dict
-2. **NAV download** — mfapi.in primary, AMFI portal fallback; NAV split/consolidation auto-correction
-3. **Risk-free rate** — dynamic, derived from overnight fund NAV history; RBI repo rate fallback pre-2019
-4. **Benchmark** — Nifty Composite Debt Index (embedded) for Alpha / Beta / Treynor
-5. **Metrics** — per 3Y / 5Y / 10Y window: Std_Dev, Sharpe, Sortino, Max_DD, Calmar; `Combined_Ratio = sqrt(Sortino × Calmar)`
-6. **Worst_Exp_Ret_%** — `min(1Y, 3Y, 5Y, 10Y CAGR) − 0.40%` STT hit for arbitrage/tax-efficient funds
-
-```
-python get_funds_data.py \
-    --input Fund_Details.csv \
-    [--output Fund_Metrics_Output.csv] \
-    [--workers 8]
-```
-
----
-
-### `reclassify_legacy_funds.py`
-Handles pre-SEBI-categorisation funds labelled as generic "Income" or "Growth" types. Scrapes Groww.in to determine whether each fund is still active and classifies it as Equity or Debt. Produces `reclassified_funds.csv`, `closed_funds.csv`, and `unresolved_funds.csv`.
-
-```
-python reclassify_legacy_funds.py \
-    --input mutual_funds_unclassified.csv \
-    [--output-dir ./output] \
-    [--delay 1.5]
+    P1 --> F1
+    P2 --> F2
+    F1 & F2 --> U1 --> F3
+    F3 --> P3 --> F4
+    F4 --> P4 --> F5
+    F5 --> P5 --> F6
+    F6 --> P6 --> O1
+    O1 --> P7 --> O2
 ```
 
 ---
 
-### `allocate_funds.py`
-The portfolio optimisation engine. Reads `Fund_Metrics_Output.csv` and solves a Mixed-Integer Linear Program to allocate capital.
+## 📐 Data Model
 
-#### MILP Formulation
+```mermaid
+classDiagram
+    class AppState {
+        +List~FundEntry~ funds
+        +List~AllocationChunk~ allocation_chunks
+        +Dict annual_requirements
+        +OtherIncome personal_income
+        +OtherIncome huf_income
+        +List~WindfallEntry~ windfalls
+        +GlidePath glide_path
+        +String allocation_mode
+        +int rebalance_spread_years
+        +to_dict() dict
+        +from_dict(d) AppState
+    }
+
+    class AllocationChunk {
+        +int year_from
+        +int year_to
+        +List~FundEntry~ funds
+        +Dict target_weights
+        +Dict constraint_slack_used
+        +portfolio_yield() float
+        +optimized_sigma() float
+        +category_yield(type) float
+    }
+
+    class FundEntry {
+        +String name
+        +String fund_type
+        +float allocation
+        +float std_dev
+        +float sharpe
+        +float sortino
+        +float calmar
+        +float max_dd
+        +float combined_ratio
+        +float cagr_1/3/5/10
+        +float worst_exp_ret
+        +String amfi_fund_type
+    }
+
+    class GlidePath {
+        +Dict schedule
+        +weights_for_year(y) Dict
+        +transition_years() List
+        +is_flat() bool
+    }
+
+    class TaxChunk {
+        +int year_from
+        +int year_to
+        +float exempt_limit
+        +List~TaxSlab~ slabs
+    }
+
+    class EquityTaxChunk {
+        +int year_from
+        +int year_to
+        +float tax_rate
+        +float exempt_limit
+    }
+
+    AppState "1" --> "0..*" AllocationChunk
+    AppState "1" --> "0..*" FundEntry
+    AppState "1" --> "0..1" GlidePath
+    AppState "1" --> "0..*" TaxChunk
+    AppState "1" --> "0..*" EquityTaxChunk
+    AllocationChunk "1" --> "1..*" FundEntry
+```
+
+---
+
+## 🧮 Optimisation Pipeline
+
+```mermaid
+flowchart TD
+    classDef decision fill:#3a2000,stroke:#f59e0b,color:#e0e0e0
+    classDef solver   fill:#1a0030,stroke:#a78bfa,color:#e0e0e0
+    classDef step     fill:#001a30,stroke:#4a90d9,color:#e0e0e0
+    classDef output   fill:#001a20,stroke:#4ade80,color:#e0e0e0
+
+    START([Fund_Metrics_Output.csv\n807 funds · 33 columns]):::output
+
+    START --> FILTER[load_and_filter\nHistory ≥ N years\nDerive AMC column]:::step
+
+    FILTER --> MODE{Allocation\nMode?}:::decision
+
+    MODE -->|Coarse| COARSE[Minimise std+dd\nsubject to return floor]:::step
+    MODE -->|Fine| FINE[Maximise return+quality\nsubject to risk ceilings]:::step
+    MODE -->|Blended α| BLEND[Sweep α 1.0→0.0\ngenerate frontier]:::step
+
+    COARSE & FINE & BLEND --> SOLVE
+
+    subgraph SOLVE["MILP Formulation  ·  _solve()  +  _solve_frontier()  +  run_pulp_*()"]
+        S1["C1: Σwᵢ = 1                     (full investment)"]
+        S2["C2: Σwᵢ·retᵢ ≥ min_return      (return floor)"]
+        S3["C3: Σwᵢ·stdᵢ ≤ max_std_dev     (volatility ceiling)"]
+        S4["C4: Σwᵢ·|ddᵢ| ≤ max_dd         (drawdown ceiling)"]
+        S5["C5+: Σwᵢ[type=T] ≤ max_per_type  (SEBI sub-type caps)"]
+        S6["C6: wᵢ ≤ max_per_fund × yᵢ     (semi-continuous upper)"]
+        S7["C7: wᵢ ≥ min_per_fund × yᵢ     (semi-continuous lower)"]
+        S8["C8+: Σwᵢ[AMC=A] ≤ max_per_amc  (AMC concentration cap)"]
+    end
+
+    SOLVE --> RELAX{Feasible?}:::decision
+    RELAX -->|No| LOOSEN[Relaxation ladder\nper-type → max_dd →\nmax_std → min_return]:::step
+    LOOSEN --> SOLVE
+    RELAX -->|Yes| CANDS[N candidate portfolios\nper chunk]:::output
+
+    CANDS --> SCORE[score_combinations\nmaximise fund overlap\nacross all chunks]:::step
+    SCORE --> SELECT[select_best_combination\nbest cross-chunk combo]:::step
+    SELECT --> FINETUNE[fine_tune\nquality-aware weight\nrebalance on selected funds]:::step
+    FINETUNE --> SUBADV[_substitution_advisor\nidentify outliers\nsuggest swaps]:::step
+    SUBADV --> WEIGHTS[(target_weights\nper AllocationChunk)]:::output
+```
+
+---
+
+## 🔀 Two-Pass Aim-and-Track
+
+*Used by **Optimize Sticky Portfolio** to minimise fund turnover between time chunks.*
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant M as main.py
+    participant AIM as Pass 1 · Aim
+    participant TRK as Pass 2 · Track
+    participant GP as glide_path.py
+
+    U->>M: Optimize Sticky Portfolio
+    M->>AIM: run_aim_pass(chunks, universe)
+
+    loop For each chunk (forward)
+        AIM->>AIM: Full MILP · zero turnover penalty
+        AIM->>AIM: Record optimal D/E/O ratios → _type_ratios
+        AIM-->>M: chunk.target_weights (unconstrained optimal)
+    end
+
+    note over AIM,TRK: Asset-class ratios LOCKED after Pass 1.<br/>Pass 2 can only choose WHICH funds fill each bucket.
+
+    M->>TRK: run_track_pass(chunks, universe)
+
+    loop For each chunk (BACKWARD from last)
+        TRK->>TRK: anchor = next chunk's target_weights
+        TRK->>TRK: minimise Σ soft-L1(w − anchor) + absence penalty
+        TRK->>TRK: subject to: D/E/O ratios == _type_ratios
+        TRK-->>M: chunk.target_weights (turnover-minimised)
+    end
+
+    M->>GP: build_glide_path(chunks, spread_years)
+    GP-->>M: GlidePath (year → weights, linearly interpolated)
+    M-->>U: Optimization Report dialog
+```
+
+---
+
+## ⚙️ Engine Simulation Loop
+
+```mermaid
+flowchart TD
+    classDef monthly fill:#001a30,stroke:#4a90d9,color:#e0e0e0
+    classDef yearly  fill:#001a20,stroke:#4ade80,color:#e0e0e0
+    classDef tax     fill:#2d0a0a,stroke:#f87171,color:#e0e0e0
+    classDef rebal   fill:#1a1a00,stroke:#f59e0b,color:#e0e0e0
+    classDef decision fill:#2a1a00,stroke:#fb923c,color:#e0e0e0
+
+    INIT([Invest corpus\nMonth 0 · FIFO lots created\nper-fund @ NAV=1.0]):::yearly
+
+    INIT --> MLOOP
+
+    subgraph MLOOP["Monthly Loop  (months 1–360)"]
+        M1[Grow each fund's NAV\nby its own CAGR ÷ 12]:::monthly
+        M2{Month ≥ SWP_START\n& corpus > 0?}:::decision
+        M3[Compute target weights\nfrom GlidePath for this FY]:::monthly
+        M4[Bounded Smart Withdrawal\ncheck weight drift + return drift\nsell over-weighted funds first]:::monthly
+        M5[Redeem FIFO lots\nto meet withdrawal target]:::monthly
+        M6[Record MonthlyRow\nprincipal · gain · corpus]:::monthly
+        M1 --> M2
+        M2 -->|No| M1
+        M2 -->|Yes| M3 --> M4 --> M5 --> M6 --> M1
+    end
+
+    MLOOP --> FYCHECK{April?\nFY boundary}:::decision
+
+    subgraph FYTAX["Annual Tax Block  (each April)"]
+        T1[Pool all FY gains\ndebt · equity · other]:::tax
+        T2[Individual:\nSlab tax + 87A rebate\non debt income]:::tax
+        T3[Individual:\n12.5% LTCG on equity\nabove annual exemption]:::tax
+        T4[HUF:\nSlab tax, no 87A\nbasic exemption absorbs LTCG]:::tax
+        T5[Apply 4% cess\nto all tax]:::tax
+        T6[Record YearSummary\ntax_personal · tax_huf\ntax_saved vs FD benchmark]:::tax
+        T1 --> T2 & T3 & T4 --> T5 --> T6
+    end
+
+    FYCHECK -->|Yes| FYTAX
+
+    FYCHECK -->|Yes,\nif transition year| REBAL
+
+    subgraph REBAL["Glide-Path Micro-Rebalancing"]
+        R1{Total drift\n< 0.5%?}:::decision
+        R2[Skip — no-trade region\nGarleanu & Pedersen]:::rebal
+        R3[Lookahead: estimate\ntotal transition CGT]:::rebal
+        R4[Annual tax budget =\ntotal_CGT ÷ spread_years]:::rebal
+        R5[HIFO lot selection\nlowest-gain lots first\n→ 30–50% CGT saving vs FIFO]:::rebal
+        R6[SWP-assisted sell:\nraise withdrawal cash from\nover-weighted funds first]:::rebal
+        R7[Buy under-weighted funds\nself-funded: tax deducted\nfrom portfolio cash]:::rebal
+        R1 -->|Yes| R2
+        R1 -->|No| R3 --> R4 --> R5 --> R6 --> R7
+    end
+
+    FYTAX --> NEXT[Next month]
+    REBAL --> NEXT
+    NEXT --> MLOOP
+
+    MLOOP -->|360 months done| DONE[(MonthlyRow 360\nYearSummary 30)]:::yearly
+```
+
+---
+
+## 🎲 Monte Carlo Simulation
+
+```mermaid
+flowchart LR
+    classDef data    fill:#1e3a5f,stroke:#4a90d9,color:#e0e0e0
+    classDef process fill:#2d1b4e,stroke:#a78bfa,color:#e0e0e0
+    classDef output  fill:#1a3a2a,stroke:#4ade80,color:#e0e0e0
+    classDef formula fill:#3a2000,stroke:#f59e0b,color:#e0e0e0
+
+    EQ[(Nifty 50\nNAV history\n~25 FYs)]:::data
+    DT[(Nifty Composite\nDebt Index\n~25 FYs)]:::data
+
+    EQ & DT --> BLOCK[Block Bootstrap\nDraw contiguous 3-year blocks\nequity + debt share same start\n→ preserves correlation]:::process
+
+    BLOCK --> BLEND["Blend per FY\nr = (w_eq + w_oth) × r_eq_centred\n   + w_debt × r_debt_centred"]:::formula
+
+    BLEND --> CENTRE["Centre each year:\nr_centred = r_hist − μ_hist + μ_det[fy]\n→ preserves fat tails & clustering\n→ mean aligned to plan return"]:::formula
+
+    CENTRE --> FLOOR["Apply floor:\nr = max(r, μ_det − 3σ)\nσ = Σ(wᵢ × σᵢ)  [linear, perfect-corr]"]:::formula
+
+    FLOOR --> SIM["Simulate 2,000 paths\ncorpus × (1+r) − withdrawal\ntrack ruin when corpus ≤ 0"]:::process
+
+    SIM --> PCTS["Percentiles per FY\nP5 · P25 · P50 · P75 · P95\ncorpus + net cash"]:::output
+
+    SIM --> RUIN["Ruin probability\n+ marginal ruin path\n(best sim that went bankrupt)"]:::output
+
+    SIM --> RAW["Raw arrays float32\n(2000 × 30)\nfor fan chart rendering"]:::output
+```
+
+---
+
+## 🖥️ Application UI Flow
+
+```mermaid
+stateDiagram-v2
+    [*] --> Startup: python run.py
+    Startup --> MainWindow: Enter user name\ncreate output directory
+
+    state MainWindow {
+        [*] --> Scenario1
+        Scenario1 --> Scenario2 : Option 2 tab
+        Scenario2 --> Scenario3 : Option 3 tab
+        Scenario3 --> Scenario4 : Option 4 tab
+
+        note right of Scenario1
+            4 independent scenarios
+            Shared: tax rules, income,
+                    requirements
+            Per-scenario: funds,
+                    return rates, allocation
+        end note
+    }
+
+    state "Data Menu" as DM {
+        FetchNames : Fetch Scheme Names\nNAVAll.txt → mutual_funds.csv
+        FetchMetrics : Fetch Fund Metrics\nNAV history → Fund_Metrics_Output.csv
+        AllocateCapital : Allocate Capital\nMILP → allocation_chunk_N.csv
+        OptimizeSticky : Optimize Sticky Portfolio\nTwo-Pass Aim-and-Track → GlidePath
+    }
+
+    state "Configuration Menu" as CM {
+        TaxRules : Tax Rules\n(Individual + HUF)
+        Requirements : Annual Withdrawal Requirements
+        FundView : View Fund Selection & Allocation
+        ReturnRate : Portfolio Return Rate Chunks
+        GlideParams : Glide-Path Parameters
+    }
+
+    state "Analysis Menu" as AM {
+        Sensitivity : Sensitivity Analysis\n(return rate sweep)
+        MonteCarlo : Monte Carlo Simulation\n(2000 paths, fan chart)
+    }
+
+    MainWindow --> DM
+    MainWindow --> CM
+    MainWindow --> AM
+
+    DM --> RunCalc : Run Calculations\n(engine.py · 360-month sim)
+    RunCalc --> Results : YearSummary table\ncharts · tax breakdown
+    Results --> AM
+```
+
+---
+
+## 📁 Module Map
 
 ```
-Variables:   w_i ∈ [0, max_per_fund]    (continuous weight for fund i)
-             y_i ∈ {0, 1}               (binary inclusion indicator)
+RetirementTaxPlanning/
+│
+├── run.py                      ← Launch: user name dialog → MainWindow
+├── main.py                     ← MainWindow · 4-scenario tabs · all menus
+│
+├── ── Data Pipeline ──
+├── get_amfi_fund_schemes_names.py   AMFI NAVAll.txt → fund list CSV
+├── fetch_amfi_aum.py                AMFI Performance API → AUM CSV
+├── get_funds_data.py                NAV history → Fund_Metrics_Output.csv
+├── reclassify_legacy_funds.py       Groww scraper → reclassify old fund types
+│
+├── ── Optimisation ──
+├── allocate_funds.py                MILP portfolio optimiser (HiGHS + PuLP)
+├── glide_path.py                    Chunk weights → year-by-year GlidePath
+│
+├── ── Simulation ──
+├── engine.py                        360-month SWP simulator + tax engine
+├── monte_carlo.py                   Historical block bootstrap MC
+│
+├── ── Data Model ──
+├── models.py                        Dataclasses: AppState, FundEntry, chunks...
+├── configuration.py                 Singleton config reader
+│
+├── ── UI Dialogs ──
+├── fund_dialog.py                   Fund selection & allocation viewer/editor
+├── tax_dialog.py                    Tax rules editor (slabs, LTCG rates)
+├── chart_dialog.py                  Matplotlib chart pop-ups (non-modal)
+├── optimization_report.py           Post-optimisation 4-tab report
+├── dialogs.py                       Income, requirements, HUF, FD rate, MC
+├── chunk_editor.py                  Reusable year-range chunk table widget
+│
+├── RetirementTaxPlanning.configuration    All tunable constants
+└── .gitignore
+```
 
-Objective:   maximise  Σ w_i × (adj_ret_i + λ × quality_norm_i)
-             where  quality_norm = Combined_Ratio / max(Combined_Ratio)
-                    λ = 10% of return spread   (quality as tiebreaker only)
+---
+
+## 🔑 Key Algorithms
+
+### MILP Portfolio Optimisation
+
+The optimizer uses **Mixed-Integer Linear Programming** (semi-continuous variables) to handle the "if selected, allocate at least X%" constraint natively — no iterative pruning needed.
+
+```
+Objective (Fine mode):
+  maximise  Σ wᵢ × (adj_retᵢ + λ × quality_normᵢ)
+  where  quality_norm = Combined_Ratio / max(Combined_Ratio)
+         λ = 10% of return spread  →  quality as tiebreaker, not driver
 
 Constraints:
-  C1:  Σ w_i = 1                              (full investment)
-  C2:  Σ w_i × ret_i  ≥ min_return            (return floor)
-  C3:  Σ w_i × std_i  ≤ max_std_dev           (volatility ceiling)
-  C4:  Σ w_i × |dd_i| ≤ max_dd               (drawdown ceiling)
-  C5+: Σ w_i [type=T] ≤ max_per_type          (per-SEBI-subcategory caps)
-  C6:  w_i ≤ max_per_fund × y_i               (semi-continuous upper link)
-  C7:  w_i ≥ min_per_fund × y_i               (semi-continuous lower link)
-  C8+: Σ w_i [AMC=A]  ≤ max_per_amc           (per-AMC concentration cap)
+  C1:  Σwᵢ = 1                       full investment
+  C2:  Σwᵢ·retᵢ ≥ min_return        return floor
+  C3:  Σwᵢ·stdᵢ ≤ max_std_dev       volatility ceiling (lin weighted)
+  C4:  Σwᵢ·|ddᵢ| ≤ max_dd          drawdown ceiling
+  C5+: Σwᵢ[type=T] ≤ max_per_type   per-SEBI-subcategory cap
+  C6:  wᵢ ≤ max_per_fund × yᵢ       semi-continuous upper link
+  C7:  wᵢ ≥ min_per_fund × yᵢ       semi-continuous lower link
+  C8+: Σwᵢ[AMC=A] ≤ max_per_amc    per-AMC concentration cap
 ```
 
-The AMC for each fund is derived from the first word of the fund name (e.g. "ICICI", "HDFC", "Kotak"), which groups all funds from the same house under a single cap.
+AMC is derived from the first word of the fund name (e.g. `"ICICI Prudential Short Term Fund"` → AMC `"Icici"`).
 
-#### Three Solver Modes
+### Sigma Convention
 
-| Mode | Objective | Use |
-|---|---|---|
-| **Coarse** | Minimise `std + \|dd\|` subject to return floor | Initial allocation — finds lowest-risk feasible portfolio |
-| **Fine** | Maximise `return + λ·quality` subject to risk ceilings | Maximises return within explicit risk constraints |
-| **Blended (α)** | `α × risk_obj + (1−α) × (−return_obj)` | Sweeps α from 1.0 → 0.0 to generate a frontier of candidates |
-
-#### Multi-Chunk Candidate Generation
-
-Three methods, selectable in the UI:
+All portfolio volatility is the **linear allocation-weighted average**:
 
 ```
-Method 1: λ-Blending  (run_aim_pass_multi)
-  α values: 1.0, 0.975, 0.95, ...  → up to N candidate portfolios per chunk
-  Each candidate must have a distinct fund set (de-duplicated by frozenset).
-
-Method 2: Frontier Walk  (run_frontier_walk)
-  P0: minimise(std + |dd|)  s.t. return ≥ target           → risk₀
-  Pk: minimise(std + |dd|)  s.t. return ≥ target,
-                                 (std + |dd|) ≥ risk_{k-1} + ε
-  Forces strictly increasing portfolio risk each step → diverse candidates.
-  Per-fund risk cap computed from P0 to prevent volatile outliers.
-
-Method 3: PuLP Commonality Walk  (run_pulp_commonality_walk)
-  CBC MILP, iterates with increasing std_dev floors.
-  Combination scorer targets:
-    ~60% of unique funds common to ALL N chunks
-    ≥20% of unique funds common to (N-1) chunks
-  → maximises fund overlap to minimise rebalancing cost.
+σ_portfolio = Σ(wᵢ × σᵢ)     ← perfect correlation, upper bound
 ```
 
-#### Two-Pass Aim-and-Track (Mode B)
+This is the same value shown in the "View Fund Selection" dialog (`Std:X.XX%`) and used by Monte Carlo. It is the most conservative valid estimate — the correct ordering is:
 
 ```
-Pass 1 — AIM  (run_aim_pass):
-  Solve each chunk independently, zero turnover penalty.
-  Records the optimal D/E/O ratios → chunk._type_ratios.
-  These ratios are LOCKED for Pass 2.
-
-Pass 2 — TRACK  (run_track_pass, backward induction):
-  Working backwards from the last chunk:
-  For chunk k, anchor = target_weights of chunk k+1 (already solved).
-  Minimise:
-      Σ sqrt((w_i − anchor_i)² + ε)     [soft-L1 total turnover]
-    + Σ P(i) × max(0, anchor_i − w_i)   [absence penalty for new funds]
-  Subject to:
-      D/E/O type ratios == chunk._type_ratios  [locked from Pass 1]
-      All original return / risk constraints (with soft tolerances)
-  
-  This completely eliminates "Conservative Drag": the solver cannot
-  reduce equity allocation in early chunks to avoid a future sell,
-  because the asset-class ratios for each chunk are fixed.
+σ_rms = sqrt(Σ wᵢ² × σᵢ²)  ≤  σ_lin = Σwᵢσᵢ  ≤  sqrt(Σwᵢσᵢ²)
+ zero correlation                 ↑ used           Jensen's ineq — not valid
+  (lower bound)               upper bound           (overestimates)
 ```
-
-#### Substitution Advisor
-
-After allocation, identifies "outlier" funds (individual std_dev > 2× portfolio weighted std), searches the full universe for lower-risk replacements, and suggests swaps. A swap is dropped if it causes > 0.1% portfolio return loss. Dropped outliers get weight shifted to successfully swapped-in candidates where possible.
-
----
-
-### `glide_path.py`
-
-Builds the `GlidePath` — a `Dict[year(1–30), Dict[fund_name, weight]]` — from per-chunk `target_weights`.
-
-#### Transition Window Formula
-
-```
-Chunk boundary at year B, transition width = spread_years (default 4):
-
-  left_start = B − (spread // 2) + 1
-  right_end  = left_start + spread − 1
-  (clipped so year 1 is a clean buy, year 30 holds to end-of-life)
-
-  For year y in [left_start, right_end]:
-      t = (y − left_start + 1) / (right_end − left_start + 1)
-      weight(fund) = (1 − t) × w_left(fund) + t × w_right(fund)
-```
-
-Linear interpolation means the engine's monthly withdrawals preferentially sell over-weighted funds, doing rebalancing work each month rather than in one large event. This avoids large CGT crystallisation at chunk boundaries.
-
----
-
-### `engine.py`
-
-The core simulation engine. Runs month-by-month for up to 360 months.
-
-#### Per-Fund FIFO Lot Tracking
-
-Each fund has its own `FIFOBucket` (list of `Lot` objects: units, purchase NAV, purchase month). NAV grows at each fund's own CAGR (5Y preferred, fallback 3Y → 1Y → category average). Redemptions consume lots FIFO. CGT calculation at FY boundaries uses exact lot history.
-
-#### Bounded Smart Withdrawal
-
-```
-Each month, before redeeming to meet the withdrawal target:
-
-1. Check WEIGHT DRIFT:
-   If any fund's actual weight deviates from target by > 1.5%,
-   enter weight-correction mode.
-
-2. Check RETURN DRIFT:
-   If blended portfolio return > anchor_return + cap (0.15% personal),
-   enter return-correction mode.
-
-3. If both within tolerance → proportional withdrawal (no correction).
-
-4. Correction mode:
-   A. Sort over-weighted funds descending by weight deviation (or return).
-   B. Sell excess from over-weighted funds top-down.
-   C. Pro-rata fallback from all funds if excess insufficient.
-```
-
-#### Annual Micro-Rebalancing (Mode B)
-
-```
-Triggered at glide-path transition years:
-
-1. No-trade check:  if Σ|target_w − current_w| < 0.5% → skip entirely.
-
-2. HIFO lot selection:
-   Sort lots ascending by unrealised gain per unit.
-   Sell lowest-gain lots first → minimises CGT 30–50% vs FIFO.
-   (Monthly SWP withdrawals still use FIFO — SEBI requirement.)
-
-3. SWP-assisted rebalancing:
-   Raise the monthly withdrawal amount preferentially from over-weighted
-   funds first → withdrawals do rebalancing work at no extra tax cost.
-
-4. Tax budget cap:
-   Lookahead: simulate the full transition cost on a deep-copy portfolio.
-   Annual tax budget = total_transition_tax / spread_years.
-   Sells stop when the running tax tally hits the budget.
-
-5. Self-funded tax:
-   Rebalancing CGT is deducted from portfolio cash (not from user's
-   SWP income). Buys are scaled to net_cash_raised − taxes_paid.
-```
-
-#### Tax Computation (FY Boundary)
-
-| Entity | Fund Type | Tax |
-|---|---|---|
-| Individual | Debt | Progressive slab; if total income ≤ exempt_limit → 0; else marginal relief |
-| Individual | Equity / Arb | 12.5% LTCG on gains above annual exemption (default ₹1.25L, rising) |
-| Individual | Other (Gold/Intl) | 12.5% flat, no exemption |
-| HUF | Debt | Same slabs; no 87A; basic exemption absorbs LTCG |
-| HUF | Equity / Other | 12.5%; unused basic exemption from debt slab offsets gains |
-| Both | STCG (< 12 months) | Flat rate; 1% exit load also charged |
-| All | — | 4% cess on all computed tax |
-
----
-
-### `monte_carlo.py`
-
-Sequence-of-returns risk simulation.
-
-#### Mode 1 — Historical Block Bootstrap (default)
-
-```
-Data sources:
-  Equity: Nifty 50 Index Fund NAV (mfapi.in → AMFI portal fallback)
-          Cached to mc_nifty50_nav.csv (refreshed if > 7 days old)
-  Debt:   Nifty Composite Debt Index (embedded in get_funds_data.py)
-          Cached to mc_debt_index.csv
-
-Block construction:
-  Draw contiguous blocks of block_length consecutive years (default 3).
-  Preserves volatility clustering (bad years follow bad years).
-  Equity and debt blocks share the same block-start index,
-  preserving the historical equity–debt correlation.
-
-Blending:
-  r_portfolio = (w_equity + w_other) × r_equity_centred
-              +  w_debt              × r_debt_centred
-
-Per-FY centering:
-  r_centred = r_historical − mean(r_history) + mu_det[fy]
-  Preserves historical shape while aligning the mean to the plan's
-  expected return for that chunk. "Other" (Gold, hybrid, international)
-  is treated as equity — conservative / higher-vol assumption.
-
-Floor:
-  r[fy] = max(r[fy], mu_det[fy] − floor_multiplier × sigma[fy])
-  Default floor_multiplier = 3  (floor = mu − 3σ)
-```
-
-#### Mode 2 — Log-Normal Fallback
-
-```
-r ~ LogNormal(mu_ln, sigma)
-where mu_ln = log(1 + mu_det) − 0.5 × sigma²
-      sigma = Σ(w_i × sigma_i)   [linear, perfect-correlation upper bound]
-```
-
-#### Sigma Convention
-
-The per-FY sigma used by Monte Carlo is the **linear allocation-weighted average** of fund std_devs:
-
-```
-sigma = Σ(w_i × sigma_i)
-```
-
-This equals `Σ(w_i × sigma_i)` — the **perfect-correlation upper bound** — and is the same number displayed in the "View Fund Selection & Allocation" dialog header (`Std:X.XX%`). It is the highest valid portfolio volatility estimate, making the Monte Carlo fan charts conservative (wider).
-
-```
-Formula ordering for reference:
-  sigma_rms_correct = sqrt(Σ w_i² × sigma_i²)   ← zero correlation  (lower bound)
-  sigma_lin         = Σ w_i × sigma_i            ← perfect correlation (upper bound, used)
-  sigma_rms_old     = sqrt(Σ w_i × sigma_i²)     ← not a valid portfolio formula;
-                                                     by Jensen's inequality ≥ sigma_lin
-```
-
----
-
-### `tax_dialog.py`
-Four-tab Qt dialog for editing all tax rules:
-
-| Tab | Contents |
-|---|---|
-| Individual – Debt | Time-chunked progressive slab editor (lower / upper / rate per slab; 87A exempt limit per chunk) |
-| Individual – Equity/Arb LTCG | Flat LTCG rate + annual exemption per time period |
-| HUF – Debt | Same slab structure; basic exemption instead of 87A |
-| HUF – Equity/Arb LTCG | Same as Individual equity |
-
----
-
-### `fund_dialog.py`
-View and edit fund allocations per chunk.
-
-- Multi-chunk colour coding: 🟢 fund present in all chunks, 🟠 some chunks, 🔴 one chunk only.
-- Live portfolio Yield, Std, and |DD| header recomputed as allocations are edited.
-- **Std displayed = linear allocation-weighted average** (`Σ w_i × σ_i`) — identical to the sigma used by Monte Carlo.
-- Sort by any risk metric; filter by fund type (debt / equity / other / all).
-
----
-
-### `optimization_report.py`
-Four-tab post-optimisation summary dialog, shown after "Optimize Sticky Portfolio" runs:
-
-| Tab | Contents |
-|---|---|
-| Glide Path Summary | Per-chunk D/E/O ratios, constraint slack consumed, year-by-year stacked weight chart |
-| Fund Selection | Fund weights per chunk, carry-over vs new funds, turnover between consecutive chunks |
-| Tax Attribution | Per-year SWP tax, rebalancing tax, exit loads; lifetime totals and percentages |
-| Robustness | Constraint slack traffic-light per chunk, years where drift tolerance skipped rebalancing |
-
----
-
-### `chart_dialog.py`
-Non-modal Matplotlib chart windows — stay open alongside the main UI. Charts: deterministic corpus trajectory, net cash per year, Monte Carlo fan charts (P5–P95 band + worst/best paths), per-fund corpus breakdown, tax savings vs FD benchmark.
-
----
-
-### `chunk_editor.py`
-Generic reusable `ChunkTableWidget` (PySide6) for any year-range parameter table. Enforces continuity automatically: `year_from[row N+1]` is always set to `year_to[row N] + 1`. Used for FD rate chunks, return chunks, HUF withdrawal chunks, and the allocation parameter chunk tables in `AllocateCapitalDialog`.
-
----
-
-### `dialogs.py`
-All non-chart secondary dialogs: annual withdrawal requirements editor, other income (salary, rental, pension, interest), windfalls, HUF withdrawal targets, FD rate chunks, return rate chunks, and the tax-optimal Individual/HUF split optimizer.
-
----
-
-### `main.py`
-`MainWindow` with four independent scenario tabs (Option 1–4). Tax rules, income, and annual requirements are shared across scenarios; fund allocations and return assumptions are scenario-specific.
-
-Key embedded dialogs:
-
-- **`AllocateCapitalDialog`** — full multi-chunk allocation UI with Coarse / Fine mode toggle, chunk parameter table, live fund-count history-status label, and log window for the subprocess run.
-- **`FetchSchemeNamesDialog`** / **`FetchFundMetricsDialog`** — threaded progress dialogs for the data pipeline steps (run in a subprocess to keep the UI responsive).
-
----
-
-### `run.py`
-Launch script. Prompts for a user name at startup (Qt dialog), sanitises it for use as a directory name, creates `<project_root>/<user_name>/` as the per-user output directory, and opens `MainWindow`.
-
----
-
-## Key Algorithms
-
-### Why Linear Std Dev (not RMS)?
-
-The Monte Carlo engine and the fund dialog both use `sigma_lin = Σ(w_i × sigma_i)`. This assumes **perfect correlation** between all funds — the most conservative valid portfolio volatility estimate. Using the upper bound means the Monte Carlo fan charts are conservative (wider spread, higher ruin probability), which is appropriate for retirement planning where you want to stress-test against the worst case.
-
-The old formula `sqrt(Σ w_i × sigma_i²)` was not a valid portfolio volatility formula at all — by Jensen's inequality it exceeds `sigma_lin`, so it was actually over-estimating volatility while being conceptually wrong.
-
-### Backward Induction Eliminates Conservative Drag
-
-A naïve single-pass penalised optimiser suffers the "Binary Cliff": if the turnover penalty is too high, the solver holds safe assets early to avoid future sells. Two-Pass decouples these concerns: Pass 1 locks the D/E/O ratios; Pass 2 can only choose *which* funds fill each bucket. The solver is physically prevented from changing asset-class allocations to reduce turnover.
 
 ### HIFO Tax-Alpha
 
-During rebalancing, lots are sorted by **ascending unrealised gain** (Highest cost-basis In, First Out). Selling the cheapest-to-realise lots first reduces realised CGT by 30–50% compared to FIFO in a mature portfolio with appreciated holdings.
+During rebalancing, lots are sorted by **ascending unrealised gain** (Highest cost-basis In, First Out). Selling the cheapest-to-realise lots reduces CGT by 30–50% vs FIFO. Normal monthly SWP withdrawals use FIFO (SEBI retail requirement).
 
-### SWP-Assisted Rebalancing
+### Backward Induction Eliminates Conservative Drag
 
-Monthly withdrawal cash is raised preferentially from over-weighted funds. Regular withdrawals do rebalancing work at no extra tax or transaction cost, reducing the volume of explicit rebalancing trades needed.
-
----
-
-## Configuration
-
-`RetirementTaxPlanning.configuration`:
-
-```ini
-# Tax
-cess_rate                    = 0.04     # 4% health & education cess
-fallback_equity_ltcg_rate    = 0.125    # 12.5% LTCG fallback
-fallback_other_ltcg_rate     = 0.125    # 12.5% for Gold/Intl
-fallback_debt_top_rate       = 0.30     # 30% top debt slab fallback
-stcg_holding_months          = 12       # months before LTCG treatment
-exit_load_fraction           = 0.01     # 1% exit load within STCG period
-
-# Withdrawal
-swp_start_month              = 3        # month withdrawals begin
-smart_withdrawal_start_month = 18       # month smart withdrawal activates
-drift_cap_personal           = 0.0015   # 0.15% return drift cap (personal)
-drift_cap_huf                = 0.0050   # 0.50% return drift cap (HUF)
-weight_drift_threshold       = 0.015    # 1.5% per-fund weight drift trigger
-
-# Rebalancing
-rebalance_no_trade_band      = 0.005    # 0.5% total drift no-trade threshold
-
-# AMFI
-amfi_sleep_between_calls     = 0.4      # seconds between API calls
-
-# File paths (relative to project root)
-allocator_default_input      = Fund_Metrics_Output.csv
-allocator_default_output     = allocation_result.csv
-default_cagr_fallback        = 7.0      # % fallback when no CAGR data
-```
+A naïve penalised optimiser suffers the *Binary Cliff*: too-high turnover penalty → solver holds safe assets early to avoid future sells. Two-Pass fixes this by locking D/E/O ratios in Pass 1. Pass 2 can only choose *which funds* fill each bucket — it cannot reduce equity allocation to avoid a future sell.
 
 ---
 
-## Installation
+## ⚙️ Configuration
+
+All tunable constants in `RetirementTaxPlanning.configuration`:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `cess_rate` | `0.04` | 4% health & education cess on all tax |
+| `stcg_holding_months` | `12` | Months before LTCG treatment applies |
+| `exit_load_fraction` | `0.01` | 1% exit load within STCG period |
+| `drift_cap_personal` | `0.0015` | 0.15% return drift cap (personal portfolio) |
+| `drift_cap_huf` | `0.0050` | 0.50% return drift cap (HUF portfolio) |
+| `weight_drift_threshold` | `0.015` | 1.5% per-fund weight deviation trigger |
+| `rebalance_no_trade_band` | `0.005` | 0.5% total portfolio drift no-trade zone |
+| `amfi_sleep_between_calls` | `0.4` | Seconds between AMFI API calls |
+| `allocator_default_input` | `Fund_Metrics_Output.csv` | Default input for the allocator |
+| `default_cagr_fallback` | `7.0` | Fallback CAGR (%) when no data available |
+
+---
+
+## 🚀 Installation
 
 ```bash
-# 1. Clone
+# Clone
 git clone https://github.com/<your-username>/RetirementTaxPlanning.git
 cd RetirementTaxPlanning
 
-# 2. Create virtual environment
+# Virtual environment
 python3 -m venv .venv
-source .venv/bin/activate          # Linux / macOS
-# .venv\Scripts\activate           # Windows
+source .venv/bin/activate        # Linux / macOS
+# .venv\Scripts\activate         # Windows
 
-# 3. Install dependencies
+# Dependencies
 pip install -r requirements.txt
 ```
 
-Core dependencies: `PySide6`, `pandas`, `numpy`, `scipy`, `matplotlib`, `requests`, `pulp`, `tqdm`.
+**Core dependencies:** `PySide6` · `pandas` · `numpy` · `scipy` · `matplotlib` · `requests` · `pulp` · `tqdm`
 
-> **Linux note:** PySide6 requires Qt platform plugins.
-> `sudo apt-get install libxcb-cursor0 libxcb-xinerama0` if you see platform errors at startup.
+> **Linux:** `sudo apt-get install libxcb-cursor0 libxcb-xinerama0` if you see Qt platform errors.
 
 ---
 
-## Usage
+## 📖 Usage
 
-### 1. Launch
+### Step 1 — Launch
 
 ```bash
 python run.py
 ```
+Enter your name. All outputs are written to `<project_root>/<your_name>/`.
 
-Enter your name at the startup prompt. All outputs go to `<project_root>/<your_name>/`.
-
-### 2. Build the fund universe  *(Data menu)*
+### Step 2 — Build the fund universe
 
 ```
-Data → Fetch Scheme Names
-  Downloads NAVAll.txt, produces mutual_funds.csv.
-  Optionally filter by AUM (e.g. ≥ ₹1,000 Cr).
-
-Data → Fetch Fund Metrics
-  Runs get_funds_data.py on your fund list.
-  Produces Fund_Metrics_Output.csv.
-  Allow 10–30 min for 500+ funds.
+Data → Fetch Scheme Names      downloads NAVAll.txt → mutual_funds.csv
+Data → Fetch Fund Metrics      NAV history → Fund_Metrics_Output.csv  (~10–30 min)
 ```
 
-### 3. Allocate capital  *(Data menu)*
+### Step 3 — Allocate capital
 
 ```
 Data → Allocate Capital
 
-  Mode: Coarse (minimise risk) or Fine (maximise return)
+  Mode:  Coarse (minimise risk)  or  Fine (maximise return)
 
-  Per-chunk parameters:
-    Min Ret%    minimum expected return floor (e.g. 7.25%)
-    Max/Fund%   max allocation to any single fund (e.g. 8%)
-    Min/Fund%   min allocation if a fund is selected (e.g. 2%)
-    Max/Type%   max allocation to any SEBI sub-category (e.g. 24%)
-    Max/AMC%    max allocation to any one AMC house (e.g. 16%)
-    Min Hist Y  minimum fund history in years (e.g. 12)
+  Per time-chunk parameters:
+    Min Ret%    minimum expected return  (e.g. 7.25%)
+    Max/Fund%   max weight per fund      (e.g. 8%)
+    Min/Fund%   min weight if selected   (e.g. 2%)
+    Max/Type%   max per SEBI sub-type    (e.g. 24%)
+    Max/AMC%    max per AMC house        (e.g. 16%)
+    Min Hist Y  minimum fund age         (e.g. 12 years)
 
-  Status bar: "N funds with minimum history of Y years selected out of M funds"
-  updates live as you change Min Hist Y.
-
-  Click ▶ Run Allocation.
-  Click ⟳ Apply Substitutions to accept the advisor's swap recommendations.
+  ▶ Run Allocation  →  ⟳ Apply Substitutions
 ```
 
-### 4. View and edit allocations  *(Portfolio menu)*
+### Step 4 — Review and edit
 
 ```
-Portfolio → View Fund Selection & Allocation
-  Review the optimizer's fund choices.
-  Edit Allocation (L) column directly if desired.
-  Header shows live: Yield, Std (lin), |DD|, D%/E%/O% ratios.
+Configuration → View Fund Selection & Allocation
+  Header: live Yield · Std (lin) · |DD| · D%/E%/O%
+  Edit allocation column directly; header updates instantly.
 ```
 
-### 5. Optimise the glide path  *(Portfolio menu, optional)*
+### Step 5 — Optimise the glide path *(optional)*
 
 ```
-Portfolio → Optimize Sticky Portfolio
-  Runs the Two-Pass Aim-and-Track algorithm.
-  Minimises fund turnover between adjacent time chunks.
-  Opens the Optimization Report dialog (glide path, fund selection,
-  tax attribution, robustness tabs).
+Data → Optimize Sticky Portfolio
+  Two-Pass Aim-and-Track minimises turnover across chunks.
+  Opens 4-tab Optimization Report.
 ```
 
-### 6. Run the simulation  *(Calculate menu)*
+### Step 6 — Run the simulation
 
 ```
-Calculate → Run Calculations
-  30-year month-by-month simulation.
-  Results appear in the main table (year-by-year corpus, tax, cash).
-  Open charts via the chart buttons.
+[Run Calculations button]        360-month simulation → annual table + charts
 
-Calculate → Monte Carlo
-  Historical block bootstrap (default) or log-normal fallback.
-  Shows corpus fan chart (P5–P95), ruin probability,
-  and the marginal ruin path (best sim that still went bankrupt).
+Analysis → Run Monte Carlo       2,000 bootstrap paths → fan chart + ruin %
 ```
 
 ---
 
-## File Outputs
+## 📤 File Outputs
 
 All written to `<project_root>/<user_name>/`:
 
-| File | Produced by | Contents |
+| File | Source | Contents |
 |---|---|---|
-| `Fund_Metrics_Output.csv` | `get_funds_data.py` | 33-column metrics for all analysed funds |
-| `allocation_chunk_N_yrX-Y.csv` | `allocate_funds.py` | Fund weights and metrics for chunk N |
-| `allocation_summary.csv` | `allocate_funds.py` | All chunks in one file with portfolio totals |
+| `Fund_Metrics_Output.csv` | `get_funds_data.py` | 33-column risk metrics for all analysed funds |
+| `allocation_chunk_N_yrX-Y.csv` | `allocate_funds.py` | Fund weights + metrics for chunk N |
+| `allocation_summary.csv` | `allocate_funds.py` | All chunks combined with portfolio totals |
 | `portfolio_viz.html` | `allocate_funds.py` | Standalone interactive risk-return visualisation |
 | `allocation_params.json` | `main.py` | Persisted allocation dialog settings |
 | `*.swp_project` | `main.py` | Full project save (AppState as JSON) |
-| `mc_nifty50_nav.csv` | `monte_carlo.py` | Cached Nifty 50 NAV history (refreshed weekly) |
-| `mc_debt_index.csv` | `monte_carlo.py` | Cached Nifty Composite Debt Index series |
+| `mc_nifty50_nav.csv` | `monte_carlo.py` | Cached Nifty 50 NAV history (weekly refresh) |
+| `mc_debt_index.csv` | `monte_carlo.py` | Cached Nifty Composite Debt Index |
 | `Schemes_and_Funds/mutual_funds.csv` | `get_amfi_fund_schemes_names.py` | Full AMFI fund universe |
 | `Schemes_and_Funds/amfi_aum.csv` | `fetch_amfi_aum.py` | Daily AUM per fund |
+
+---
+
+## 📜 Licence
+
+Private repository — all rights reserved.
