@@ -3,6 +3,8 @@
 > A desktop application for Indian retirees planning a **Systematic Withdrawal Plan (SWP)** from a portfolio of mutual funds — optimising fund selection, computing taxes across Individual and HUF entities, and stress-testing corpus survival with Monte Carlo simulation over a 30-year horizon.
 > Nearly 21000 lines of python code
 
+<img width="1517" height="901" alt="image" src="https://github.com/user-attachments/assets/41ba26db-2007-4300-b5fe-332e9c600fa7" />
+
 > **Copyright (c) 2025 Uddipan Bagchi. All rights reserved.**
 > **See LICENSE in the project root for license information.**
 
@@ -21,6 +23,8 @@ The core thesis: a well-structured portfolio of **debt + arbitrage mutual funds*
 | 💰 **Full Tax Engine** | Month-by-month simulation: progressive slabs, LTCG, STCG, 87A marginal relief, cess, exit loads — Individual and HUF in parallel |
 | 🎲 **Monte Carlo** | Historical Block Bootstrap using real Nifty 50 + Nifty Composite Debt index data; log-normal fallback |
 | 📋 **4-Scenario Comparison** | Run up to 4 independent allocation strategies side-by-side |
+
+<img width="1520" height="900" alt="image" src="https://github.com/user-attachments/assets/cb13c899-b099-4082-aab4-8939b2024fcd" />
 
 ---
 
