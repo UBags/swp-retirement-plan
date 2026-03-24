@@ -26,6 +26,8 @@ The core thesis: a well-structured portfolio of **debt + arbitrage mutual funds*
 
 <img width="1520" height="900" alt="image" src="https://github.com/user-attachments/assets/cb13c899-b099-4082-aab4-8939b2024fcd" />
 
+<img width="1589" height="739" alt="image" src="https://github.com/user-attachments/assets/d0a4cb07-e707-468f-9cec-0c2fc84c780b" />
+
 ---
 
 ## 🗺️ System Architecture
